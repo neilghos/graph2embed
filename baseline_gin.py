@@ -1,34 +1,76 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import argparse
+from torch_geometric.nn import GINConv, global_add_pool
 from dataset import get_dataset
-from model import ConvReaderGraphEmbedding
 
-def train(dataset_name):
-    print(f"Loading dataset: {dataset_name}...")
+class StandardGIN(nn.Module):
+    def __init__(self, num_node_features, hidden_dim, num_classes, num_layers=5):
+        super().__init__()
+        
+        self.convs = nn.ModuleList()
+        self.batch_norms = nn.ModuleList()
+        
+        # Input layer
+        self.convs.append(GINConv(
+            nn.Sequential(
+                nn.Linear(num_node_features, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim)
+            )
+        ))
+        self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
+        
+        # Hidden layers
+        for _ in range(num_layers - 1):
+            self.convs.append(GINConv(
+                nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, hidden_dim)
+                )
+            ))
+            self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
+            
+        # Linear classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, num_classes)
+        )
+
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        
+        # GIN layers
+        for conv, batch_norm in zip(self.convs, self.batch_norms):
+            x = F.relu(batch_norm(conv(x, edge_index)))
+            
+        # Global Readout
+        x = global_add_pool(x, batch)
+        
+        # Classify
+        return self.classifier(x)
+
+def train_baseline(dataset_name):
+    print(f"Loading dataset: {dataset_name} for Standard GIN Baseline...")
     dataset, train_loader, val_loader, test_loader = get_dataset(name=dataset_name, batch_size=32)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
     num_node_features = dataset.num_node_features
-    # If the dataset has no node features (e.g., IMDB-BINARY), we typically use a constant feature of 1.
-    # PyG doesn't automatically do this for all datasets, but GIN can work with one-hot degree or constants.
-    # For now, if num_node_features is 0, we'll set it to 1 and handle it in the model (requires small tweak)
-    # Actually, many TUDatasets have node labels. Let's stick with standard for now.
-    
     num_classes = dataset.num_classes
     
-    model = ConvReaderGraphEmbedding(
+    model = StandardGIN(
         num_node_features=max(1, num_node_features), # fallback for 0 feature datasets
         hidden_dim=64,
         num_classes=num_classes,
-        walk_length=5,
-        walks_per_node=5,
-        conv_kernel_size=3
+        num_layers=5
     ).to(device)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01) # Standard GIN LR is often 0.01
     criterion = nn.CrossEntropyLoss()
     
     best_val_acc = 0.0
@@ -97,12 +139,12 @@ def train(dataset_name):
             test_total += data.num_graphs
             
     test_acc = test_correct / test_total
-    print(f"\nFinal Test Accuracy: {test_acc:.4f}")
-    print(f"Best Validation Accuracy: {best_val_acc:.4f}")
+    print(f"\nBaseline GIN Final Test Accuracy: {test_acc:.4f}")
+    print(f"Baseline GIN Best Validation Accuracy: {best_val_acc:.4f}")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Train ConvReader Baseline")
+    parser = argparse.ArgumentParser(description="Train Standard GIN Baseline")
     parser.add_argument('--dataset', type=str, default='MUTAG', help='TUDataset name (e.g. MUTAG, PROTEINS, NCI1)')
     args = parser.parse_args()
     
-    train(args.dataset)
+    train_baseline(args.dataset)

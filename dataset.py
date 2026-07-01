@@ -5,8 +5,8 @@ from torch_geometric.datasets import TUDataset
 from torch_geometric.loader import DataLoader
 import torch
 
-def get_mutag_dataset(batch_size=32):
-    dataset = TUDataset(root='data/TUDataset', name='MUTAG')
+def get_dataset(name='MUTAG', batch_size=32):
+    dataset = TUDataset(root='data/TUDataset', name=name)
     
     # Shuffle and split
     dataset = dataset.shuffle()
