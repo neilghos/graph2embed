@@ -4,7 +4,7 @@ from baseline_gin import train_baseline as train_gin
 
 def main():
     # Only test on the requested datasets
-    datasets = ['MUTAG', 'PROTEINS']
+    datasets = ['MUTAG']
     num_seeds = 10
     
     results = {}
@@ -20,8 +20,8 @@ def main():
         for seed in range(num_seeds):
             print(f"\n--- Seed {seed} ---")
             
-            # Train ConvReader
-            print("Training ConvReader V2...")
+            # Train LSTMReader
+            print("Training LSTMReader V2...")
             acc_conv = train_convreader(dataset, seed=seed)
             convreader_accs.append(acc_conv)
             

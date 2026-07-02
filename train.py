@@ -4,7 +4,7 @@ import argparse
 import random
 import numpy as np
 from dataset import get_dataset
-from model import ConvReaderGraphEmbedding
+from model import LSTMReaderGraphEmbedding
 
 import os
 
@@ -39,16 +39,15 @@ def train(dataset_name, seed=42):
     
     num_classes = dataset.num_classes
     
-    model = ConvReaderGraphEmbedding(
+    model = LSTMReaderGraphEmbedding(
         num_node_features=max(1, num_node_features), # fallback for 0 feature datasets
         hidden_dim=64,
         num_classes=num_classes,
         walk_length=5,
-        walks_per_node=5,
-        conv_kernel_size=3
+        walks_per_node=5
     ).to(device)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
     criterion = nn.CrossEntropyLoss()
     
     best_val_acc = 0.0

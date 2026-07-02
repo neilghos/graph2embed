@@ -26,8 +26,8 @@ def random_walk(row, col, start, walk_length, num_nodes):
         
     return torch.stack(walks, dim=1)
 
-class ConvReaderGraphEmbedding(nn.Module):
-    def __init__(self, num_node_features, hidden_dim, num_classes, walk_length=5, walks_per_node=5, conv_kernel_size=3):
+class LSTMReaderGraphEmbedding(nn.Module):
+    def __init__(self, num_node_features, hidden_dim, num_classes, walk_length=5, walks_per_node=5):
         super().__init__()
         self.walk_length = walk_length
         self.walks_per_node = walks_per_node
@@ -49,14 +49,22 @@ class ConvReaderGraphEmbedding(nn.Module):
         # 2. Edge Embedding: Linear(concat(u, v))
         self.edge_emb = nn.Linear(hidden_dim * 2, hidden_dim)
         
-        # 3. Convolutional Reader
-        self.conv1d = nn.Conv1d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=conv_kernel_size, padding=conv_kernel_size//2)
+        # 3. LSTM Reader
+        # Bidirectional LSTM to process the walk sequences
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
         
         # 4. Classifier
+        # Bidirectional LSTM outputs 2 * hidden_dim
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, num_classes)
+            nn.Linear(hidden_dim, num_classes)
         )
 
     def forward(self, data):
@@ -102,23 +110,15 @@ class ConvReaderGraphEmbedding(nn.Module):
                 sequence_tensors.append(e_emb)
                 
         # Stack sequence: [num_walks, seq_len, hidden_dim]
+        # LSTM with batch_first=True expects this exact format!
         seq = torch.stack(sequence_tensors, dim=1) 
         
-        # Conv1d expects [batch, channels, seq_len]
-        seq = seq.transpose(1, 2) # [num_walks, hidden_dim, seq_len]
+        # 3. Bidirectional LSTM Reader
+        # lstm_out: [num_walks, seq_len, 2 * hidden_dim]
+        lstm_out, _ = self.lstm(seq)
         
-        # 3. Multi-Directional Convolutional Reader
-        # Forward pass
-        conv_fwd = F.relu(self.conv1d(seq)) # [num_walks, hidden_dim, seq_len]
-        path_fwd, _ = torch.max(conv_fwd, dim=-1) # [num_walks, hidden_dim]
-        
-        # Backward pass (flip the sequence length dimension)
-        seq_rev = torch.flip(seq, dims=[2])
-        conv_rev = F.relu(self.conv1d(seq_rev))
-        path_rev, _ = torch.max(conv_rev, dim=-1) # [num_walks, hidden_dim]
-        
-        # Pool bidirectional paths (Sum)
-        path_emb = path_fwd + path_rev # [num_walks, hidden_dim]
+        # Max pool over the sequence length (temporal) dimension
+        path_emb, _ = torch.max(lstm_out, dim=1) # [num_walks, 2 * hidden_dim]
         
         # 4. Graph-level pooling
         walk_batch = batch[start] # [num_walks]
