@@ -2,8 +2,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import argparse
+import random
+import numpy as np
 from torch_geometric.nn import GINConv, global_add_pool
 from dataset import get_dataset
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 class StandardGIN(nn.Module):
     def __init__(self, num_node_features, hidden_dim, num_classes, num_layers=5):
@@ -53,8 +65,10 @@ class StandardGIN(nn.Module):
         # Classify
         return self.classifier(x)
 
-def train_baseline(dataset_name):
-    print(f"Loading dataset: {dataset_name} for Standard GIN Baseline...")
+def train_baseline(dataset_name, seed=42):
+    set_seed(seed) # Fix seed for reproducible splits and initialization
+    
+    print(f"Loading dataset: {dataset_name} for Standard GIN Baseline (Seed: {seed})...")
     dataset, train_loader, val_loader, test_loader = get_dataset(name=dataset_name, batch_size=32)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -120,10 +134,16 @@ def train_baseline(dataset_name):
         
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            # Save the best model
+            torch.save(model.state_dict(), f'best_baseline_{dataset_name}.pth')
             
         if epoch % 10 == 0:
             print(f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
             
+    # Load the best model before testing
+    print(f"\nLoading best model weights for testing...")
+    model.load_state_dict(torch.load(f'best_baseline_{dataset_name}.pth'))
+    
     # Test
     model.eval()
     test_correct = 0
@@ -141,10 +161,13 @@ def train_baseline(dataset_name):
     test_acc = test_correct / test_total
     print(f"\nBaseline GIN Final Test Accuracy: {test_acc:.4f}")
     print(f"Baseline GIN Best Validation Accuracy: {best_val_acc:.4f}")
+    
+    return test_acc
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train Standard GIN Baseline")
     parser.add_argument('--dataset', type=str, default='MUTAG', help='TUDataset name (e.g. MUTAG, PROTEINS, NCI1)')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
     args = parser.parse_args()
     
-    train_baseline(args.dataset)
+    train_baseline(args.dataset, args.seed)
