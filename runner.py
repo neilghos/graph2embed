@@ -4,7 +4,7 @@ from baseline_gin import train_baseline as train_gin
 
 def main():
     # Only test on the requested datasets
-    datasets = ['MUTAG']
+    datasets = ["PTC_MR"]
     num_seeds = 10
     
     results = {}
