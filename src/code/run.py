@@ -1,6 +1,7 @@
 import os
 import re
 import ssl
+import csv
 from importlib.metadata import PackageNotFoundError, version
 
 import numpy as np
@@ -54,8 +55,7 @@ from pathlib import Path
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.utils import degree
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger
+from pytorch_lightning.callbacks import EarlyStopping
 from tqdm.auto import tqdm
 
 from models.graph_models import GNN
@@ -65,6 +65,33 @@ MOLNET_DS = ['QM9', 'FreeSolv', 'Lipo', 'HIV', 'BBBP', 'SIDER']
 PYG_DS = ['ENZYMES', 'github_stargazers', 'reddit_threads', 'SYNTHETIC', 'SYNTHETICnew',
           'Synthie', 'Cuneiform', 'IMDB-BINARY', 'MUTAG', 'Mutagenicity']
 PYG_OTHER_DS = ['ZINC', 'GNNBenchmark_MNIST']
+RESULTS_ROOT = Path(__file__).resolve().parents[1] / 'results'
+
+RESULT_FIELDNAMES = [
+    'dataset',
+    'task_type',
+    'row_type',
+    'itr',
+    'test_epoch',
+    'conv_type',
+    'readout',
+    'num_layers',
+    'gnn_intermediate_dim',
+    'gnn_output_node_dim',
+    'output_nn_intermediate_dim',
+    'learning_rate',
+    'gat_heads',
+    'gat_dropouts',
+    'pna_num_towers',
+    'pna_num_pre_layers',
+    'pna_num_post_layers',
+    'walk_length',
+    'walks_per_node',
+    'mae',
+    'r2',
+    'auroc',
+    'mcc',
+]
 
 
 def filter_model_only_args(all_argsdict, include_in_channels=True):
@@ -100,12 +127,81 @@ def deepchem_iterable_dataset_to_tensors(iter_dataset, use_cuda=False):
     return new_dataset_as_list
 
 
-def print_test_metrics(task_type, test_metrics_per_epoch):
+def get_latest_test_metrics(test_metrics_per_epoch):
     if not test_metrics_per_epoch:
-        return
+        return None, None
 
     test_epoch = max(test_metrics_per_epoch.keys())
-    metrics = test_metrics_per_epoch[test_epoch]
+    return test_epoch, test_metrics_per_epoch[test_epoch]
+
+
+def infer_dataset_name(argsdict):
+    if argsdict['moleculenet_dataset'] is not None:
+        return argsdict['moleculenet_dataset']
+    if argsdict['pyg_dataset'] is not None:
+        return argsdict['pyg_dataset']
+    if argsdict['custom_dataset_train'] is not None:
+        return Path(argsdict['custom_dataset_train']).stem
+
+    return 'unknown'
+
+
+def sanitize_path_component(value):
+    value = str(value).strip()
+    value = re.sub(r'[^A-Za-z0-9._-]+', '-', value)
+    return value.strip('-.') or 'unknown'
+
+
+def build_run_output_dir(argsdict):
+    dataset_name = sanitize_path_component(infer_dataset_name(argsdict))
+    conv_type = sanitize_path_component(argsdict['conv_type'])
+    readout = sanitize_path_component(argsdict['readout'])
+
+    config_parts = [
+        f'l{argsdict["num_layers"]}',
+        f'h{argsdict["gnn_intermediate_dim"]}',
+        f'n{argsdict["gnn_output_node_dim"]}',
+        f'o{argsdict["output_nn_intermediate_dim"]}',
+        f'lr{str(argsdict["learning_rate"]).replace(".", "p")}',
+    ]
+
+    if argsdict['conv_type'] in ['GAT', 'GATv2']:
+        config_parts.append(f'heads{argsdict["gat_heads"]}')
+    if argsdict['conv_type'] == 'PNA':
+        config_parts.extend([
+            f'towers{argsdict["pna_num_towers"]}',
+            f'pre{argsdict["pna_num_pre_layers"]}',
+            f'post{argsdict["pna_num_post_layers"]}',
+        ])
+    if argsdict['readout'] == 'ours':
+        config_parts.extend([
+            f'wl{argsdict["walk_length"]}',
+            f'wpn{argsdict["walks_per_node"]}',
+        ])
+
+    config_tag = '_'.join(sanitize_path_component(part) for part in config_parts)
+
+    config_dir = RESULTS_ROOT / dataset_name / conv_type / readout / config_tag
+
+    if argsdict['itr'] is not None:
+        return config_dir
+    if argsdict['moleculenet_random_split_seed'] is not None:
+        return config_dir / f'seed{argsdict["moleculenet_random_split_seed"]}'
+
+    return config_dir
+
+
+def parse_optional_float(value):
+    if value in (None, '', 'None'):
+        return None
+
+    return float(value)
+
+
+def print_test_metrics(task_type, test_metrics_per_epoch):
+    test_epoch, metrics = get_latest_test_metrics(test_metrics_per_epoch)
+    if metrics is None:
+        return
 
     print(f'Test paper metrics from epoch {test_epoch}:')
     if task_type == 'regression':
@@ -119,17 +215,96 @@ def print_test_metrics(task_type, test_metrics_per_epoch):
         print(f'  MCC: {mcc:.6f}')
 
 
-def load_latest_saved_test_metrics(run_dir):
-    metrics_path = Path(run_dir) / 'saved_data' / 'test_metrics_per_epoch.npy'
-    if not metrics_path.exists():
+def build_result_row(task_type, argsdict, test_metrics_per_epoch):
+    test_epoch, metrics = get_latest_test_metrics(test_metrics_per_epoch)
+    if metrics is None:
         return None
 
-    test_metrics_per_epoch = np.load(metrics_path, allow_pickle=True).item()
-    if not test_metrics_per_epoch:
-        return None
+    row = {
+        'dataset': infer_dataset_name(argsdict),
+        'task_type': task_type,
+        'row_type': 'iter' if argsdict['itr'] is not None else 'result',
+        'itr': argsdict['itr'],
+        'test_epoch': test_epoch,
+        'mae': '',
+        'r2': '',
+        'auroc': '',
+        'mcc': '',
+    }
+    row.update(filter_model_only_args(argsdict, include_in_channels=False))
 
-    test_epoch = max(test_metrics_per_epoch.keys())
-    return test_metrics_per_epoch[test_epoch]
+    if task_type == 'regression':
+        mae, _, _, r2, _ = metrics
+        row.update({
+            'mae': float(mae),
+            'r2': float(r2),
+        })
+    else:
+        _, roc_auc, _, mcc = metrics
+        row.update({
+            'auroc': '' if roc_auc is None else float(roc_auc),
+            'mcc': float(mcc),
+        })
+
+    return row
+
+
+def write_result_csv(out_dir, row):
+    if row is None:
+        return
+
+    out_path = Path(out_dir)
+    out_path.mkdir(exist_ok=True, parents=True)
+    result_path = out_path / 'result.csv'
+
+    existing_rows = load_result_rows(out_dir)
+    normalized_row = {field: row.get(field, '') for field in RESULT_FIELDNAMES}
+
+    if normalized_row['row_type'] == 'iter':
+        iter_rows = [existing_row for existing_row in existing_rows if existing_row.get('row_type') == 'iter']
+        iter_rows = [existing_row for existing_row in iter_rows if str(existing_row.get('itr', '')) != str(normalized_row['itr'])]
+        iter_rows.append(normalized_row)
+        iter_rows.sort(key=lambda existing_row: int(existing_row['itr']))
+        rows_to_write = iter_rows + build_summary_rows(iter_rows)
+    else:
+        rows_to_write = [normalized_row]
+
+    with result_path.open('w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows_to_write)
+
+
+def load_result_rows(run_dir):
+    result_path = Path(run_dir) / 'result.csv'
+    if not result_path.exists():
+        return []
+
+    with result_path.open('r', newline='') as handle:
+        return list(csv.DictReader(handle))
+
+
+def build_summary_rows(iter_rows):
+    if not iter_rows:
+        return []
+
+    template = iter_rows[0]
+    summary_rows = []
+
+    for row_type, reducer in [('mean', np.mean), ('std', np.std)]:
+        summary_row = {field: template.get(field, '') for field in RESULT_FIELDNAMES}
+        summary_row['row_type'] = row_type
+        summary_row['itr'] = ''
+        summary_row['test_epoch'] = ''
+
+        for metric_name in ['mae', 'r2', 'auroc', 'mcc']:
+            values = [parse_optional_float(iter_row.get(metric_name)) for iter_row in iter_rows]
+            values = [value for value in values if value is not None]
+            summary_row[metric_name] = '' if not values else float(reducer(values))
+
+        summary_rows.append(summary_row)
+
+    return summary_rows
 
 
 def print_iter_aggregate(task_type, out_dir):
@@ -171,6 +346,31 @@ def print_iter_aggregate(task_type, out_dir):
         print(f'  MCC: {np.mean(mccs):.6f} ± {np.std(mccs):.6f}')
 
 
+def print_iter_aggregate(task_type, out_dir):
+    iter_rows = [row for row in load_result_rows(out_dir) if row.get('row_type') == 'iter']
+    if not iter_rows:
+        return
+
+    completed_iters = sorted(int(row['itr']) for row in iter_rows)
+
+    print(f'Aggregate paper metrics over {len(iter_rows)} completed iters {completed_iters}:')
+    if task_type == 'regression':
+        maes = [parse_optional_float(row['mae']) for row in iter_rows]
+        r2s = [parse_optional_float(row['r2']) for row in iter_rows]
+        maes = [value for value in maes if value is not None]
+        r2s = [value for value in r2s if value is not None]
+        print(f'  MAE: {np.mean(maes):.6f} +- {np.std(maes):.6f}')
+        print(f'  R2: {np.mean(r2s):.6f} +- {np.std(r2s):.6f}')
+    else:
+        aurocs = [parse_optional_float(row['auroc']) for row in iter_rows]
+        mccs = [parse_optional_float(row['mcc']) for row in iter_rows]
+        aurocs = [value for value in aurocs if value is not None]
+        mccs = [value for value in mccs if value is not None]
+        if aurocs:
+            print(f'  AUROC: {np.mean(aurocs):.6f} +- {np.std(aurocs):.6f}')
+        print(f'  MCC: {np.mean(mccs):.6f} +- {np.std(mccs):.6f}')
+
+
 def main():
     # ------------
     # args
@@ -179,7 +379,6 @@ def main():
 
     # Program-level args
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--out_dir', type=str)
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--early_stopping_patience', type=int, default=30)
 
@@ -242,7 +441,9 @@ def main():
 
     if argsdict['custom_dataset_train'] is None:
         assert argsdict['dataset_download_dir'] is not None, 'Must provide a download directory for the datasets.'
-    assert argsdict['out_dir'] is not None, 'Must provide an output directory for the checkpoints and saved data.'
+
+    argsdict['out_dir'] = str(build_run_output_dir(argsdict))
+    print(f'Results will be written to: {argsdict["out_dir"]}')
 
     assert argsdict['num_layers'] is not None and argsdict['num_layers'] > 1, 'Must provide a number of layers that is > 1.'
 
@@ -516,14 +717,6 @@ def main():
 
     monitor = 'validation_total_loss' if argsdict['custom_dataset_train'] is None else 'train_total_loss'
 
-    checkpoint = ModelCheckpoint(
-            monitor=monitor,
-            dirpath=argsdict['out_dir'],
-            filename='gnn-{epoch:03d}-{validation_total_loss:.5f}' if argsdict['custom_dataset_train'] is None else 'gnn-{epoch:03d}-{train_total_loss:.5f}',
-            save_top_k=1 if argsdict['custom_dataset_train'] is None else -1,
-            mode='min',
-        )
-
     if argsdict['custom_dataset_train'] is None:
         early_stopping = EarlyStopping(
                 monitor=monitor,
@@ -533,14 +726,15 @@ def main():
                 mode='min'
             )
 
-    callbacks = [checkpoint, early_stopping] if argsdict['custom_dataset_train'] is None else [checkpoint]
+    callbacks = [early_stopping] if argsdict['custom_dataset_train'] is None else []
 
     print('Creating Trainer...')
-    logs_path = os.path.join(argsdict['out_dir'], 'logs/')
-    Path(logs_path).mkdir(exist_ok=True, parents=True)
-    logger = CSVLogger(save_dir=logs_path, name='gnn_logs')
-
-    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, logger=logger)
+    trainer = pl.Trainer.from_argparse_args(
+        args,
+        callbacks=callbacks,
+        logger=False,
+        enable_checkpointing=False,
+    )
 
     print('Starting training...')
 
@@ -564,20 +758,14 @@ def main():
     # saving
     # ------------
     if should_test_flag:
-        save_out_path = os.path.join(argsdict['out_dir'], 'saved_data')
-        Path(save_out_path).mkdir(exist_ok=True, parents=True)
-
-
-        np.save(os.path.join(save_out_path, 'train_metrics_per_epoch.npy'), model.train_metrics_per_epoch)
-        np.save(os.path.join(save_out_path, 'validation_metrics_per_epoch.npy'), model.validation_metrics_per_epoch)
-        np.save(os.path.join(save_out_path, 'test_metrics_per_epoch.npy'), model.test_metrics_per_epoch)
-
-        np.save(os.path.join(save_out_path, 'test_graphs_per_epoch.npy'), model.test_graphs_per_epoch)
-
-        # np.save(os.path.join(save_out_path, 'train_predictions_per_epoch.npy'), model.train_outputs)
-        # np.save(os.path.join(save_out_path, 'validation_predictions_per_epoch.npy'), model.validation_outputs)
-        np.save(os.path.join(save_out_path, 'test_predictions_per_epoch.npy'), model.test_outputs)
-
+        write_result_csv(
+            out_dir=argsdict['out_dir'],
+            row=build_result_row(
+                task_type=task_type,
+                argsdict=argsdict,
+                test_metrics_per_epoch=model.test_metrics_per_epoch,
+            ),
+        )
         print_iter_aggregate(task_type=task_type, out_dir=argsdict['out_dir'])
 
 
