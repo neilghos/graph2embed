@@ -82,9 +82,6 @@ RESULT_FIELDNAMES = [
     'learning_rate',
     'gat_heads',
     'gat_dropouts',
-    'pna_num_towers',
-    'pna_num_pre_layers',
-    'pna_num_post_layers',
     'walk_length',
     'walks_per_node',
     'mae',
@@ -96,8 +93,7 @@ RESULT_FIELDNAMES = [
 
 def filter_model_only_args(all_argsdict, include_in_channels=True):
     model_keys = ['conv_type', 'gnn_intermediate_dim', 'gnn_output_node_dim', 'output_nn_intermediate_dim', 'readout',
-                  'learning_rate', 'gat_heads', 'gat_dropouts', 'pna_num_towers', 'pna_num_pre_layers',
-                  'pna_num_post_layers',
+                  'learning_rate', 'gat_heads', 'gat_dropouts',
                   'num_layers', 'walk_length', 'walks_per_node']
     if include_in_channels:
         model_keys.append('in_channels')
@@ -165,14 +161,8 @@ def build_run_output_dir(argsdict):
         f'lr{str(argsdict["learning_rate"]).replace(".", "p")}',
     ]
 
-    if argsdict['conv_type'] in ['GAT', 'GATv2']:
+    if argsdict['conv_type'] == 'GATv2':
         config_parts.append(f'heads{argsdict["gat_heads"]}')
-    if argsdict['conv_type'] == 'PNA':
-        config_parts.extend([
-            f'towers{argsdict["pna_num_towers"]}',
-            f'pre{argsdict["pna_num_pre_layers"]}',
-            f'post{argsdict["pna_num_post_layers"]}',
-        ])
     if argsdict['readout'] == 'ours':
         config_parts.extend([
             f'wl{argsdict["walk_length"]}',
@@ -307,7 +297,7 @@ def build_summary_rows(iter_rows):
     return summary_rows
 
 
-def print_iter_aggregate(task_type, out_dir):
+def _legacy_print_iter_aggregate(task_type, out_dir):
     out_path = Path(out_dir)
     match = re.match(r'^(?P<prefix>.+)_itr(?P<itr>\d+)$', out_path.name)
     if match is None:
@@ -447,13 +437,8 @@ def main():
 
     assert argsdict['num_layers'] is not None and argsdict['num_layers'] > 1, 'Must provide a number of layers that is > 1.'
 
-    if argsdict['conv_type'] in ['GAT', 'GATv2']:
-        assert argsdict['gat_heads'] is not None and argsdict['gat_dropouts'] is not None, 'Must provide the --gat_heads and --gat_dropouts arguments for GAT and GATv2.'
-
-    if argsdict['conv_type'] == 'PNA':
-        assert argsdict['pna_num_towers'] is not None and argsdict['pna_num_pre_layers'] is not None and argsdict['pna_num_post_layers'] is not None, 'Must provide the --pna_num_towers --pna_num_pre_layers and --pna_num_post_layers arguments for PNA.'
-        assert argsdict['gnn_output_node_dim'] % argsdict['pna_num_towers'] == 0, '--gnn_output_node_dim must be divisible by --pna_num_towers.'
-        assert argsdict['gnn_intermediate_dim'] % argsdict['pna_num_towers'] == 0, '--gnn_intermediate_dim must be divisible by --pna_num_towers.'
+    if argsdict['conv_type'] == 'GATv2':
+        assert argsdict['gat_heads'] is not None and argsdict['gat_dropouts'] is not None, 'Must provide the --gat_heads and --gat_dropouts arguments for GATv2.'
 
     # ------------
     # data
@@ -550,14 +535,6 @@ def main():
 
         num_tasks = len(tasks)
 
-        if argsdict['conv_type'] == 'PNA':
-            print('Computing max degree for PNA...')
-            degree_0 = np.max([np.max(degree(d.edge_index[0]).detach().cpu().numpy()) for d in train_dataset])
-            degree_1 = np.max([np.max(degree(d.edge_index[1]).detach().cpu().numpy()) for d in train_dataset])
-            deg = int(max(degree_0, degree_1)) + 1
-        else:
-            deg = 0
-
     elif argsdict['pyg_dataset'] == 'GNNBenchmark_MNIST':
         import torch_geometric.datasets as ds
         root = argsdict['dataset_download_dir']
@@ -571,14 +548,6 @@ def main():
 
         in_channels = train_dataset.num_node_features
         num_tasks = train_dataset.num_classes
-
-        if argsdict['conv_type'] == 'PNA':
-            print('Computing max degree for PNA...')
-            degree_0 = np.max([np.max(degree(d.edge_index[0]).detach().cpu().numpy()) for d in train_dataset])
-            degree_1 = np.max([np.max(degree(d.edge_index[1]).detach().cpu().numpy()) for d in train_dataset])
-            deg = int(max(degree_0, degree_1)) + 1
-        else:
-            deg = 0
 
         train_loader = DataLoader(train_dataset, batch_size=argsdict['batch_size'], shuffle=True)
         validation_loader = DataLoader(validation_dataset, batch_size=argsdict['batch_size'])
@@ -600,14 +569,6 @@ def main():
         in_channels = train_dataset.num_node_features
         num_tasks = 1
 
-        if argsdict['conv_type'] == 'PNA':
-            print('Computing max degree for PNA...')
-            degree_0 = np.max([np.max(degree(d.edge_index[0]).detach().cpu().numpy()) for d in train_dataset])
-            degree_1 = np.max([np.max(degree(d.edge_index[1]).detach().cpu().numpy()) for d in train_dataset])
-            deg = int(max(degree_0, degree_1)) + 1
-        else:
-            deg = 0
-
     elif argsdict['pyg_dataset'] is not None and argsdict['pyg_dataset'] in ['ENZYMES', 'github_stargazers', 'reddit_threads',
                                                                               'SYNTHETIC', 'SYNTHETICnew', 'Synthie',
                                                                               'Cuneiform', 'IMDB-BINARY', 'MUTAG',
@@ -620,11 +581,9 @@ def main():
 
         dataset = ds.TUDataset(root=root, name=argsdict['pyg_dataset'], use_node_attr=True)
 
-        degree_0 = np.max([np.max(degree(d.edge_index[0]).detach().cpu().numpy()) for d in dataset])
-        degree_1 = np.max([np.max(degree(d.edge_index[1]).detach().cpu().numpy()) for d in dataset])
-        deg = int(max(degree_0, degree_1)) + 1
-
         if argsdict['pyg_dataset'] in ['github_stargazers', 'IMDB-BINARY', 'reddit_threads']:
+            degree_0 = np.max([np.max(degree(d.edge_index[0]).detach().cpu().numpy()) for d in dataset])
+            degree_1 = np.max([np.max(degree(d.edge_index[1]).detach().cpu().numpy()) for d in dataset])
             dataset = ds.TUDataset(root=root, name=argsdict['pyg_dataset'],
                                    transform=T.OneHotDegree(max_degree=int(max(degree_0, degree_1))))
             in_channels = int(max(degree_0, degree_1)) + 1
@@ -679,15 +638,6 @@ def main():
         train_dataset = custom_dataset.dataset
 
 
-        if argsdict['conv_type'] == 'PNA':
-            print('Computing max degree for PNA...')
-            degree_0 = np.max([np.max(degree(d.edge_index[0]).detach().cpu().numpy()) for d in train_dataset])
-            degree_1 = np.max([np.max(degree(d.edge_index[1]).detach().cpu().numpy()) for d in train_dataset])
-            deg = int(max(degree_0, degree_1)) + 1
-        else:
-            deg = 0
-
-
     if argsdict['pyg_dataset']:
         train_loader = DataLoader(train_dataset, batch_size=argsdict['batch_size'], shuffle=True)
         validation_loader = DataLoader(validation_dataset, batch_size=argsdict['batch_size'])
@@ -706,7 +656,7 @@ def main():
     print('Creating model...')
     model = GNN(in_channels=in_channels,
         **filter_model_only_args(argsdict, include_in_channels=False), output_nn_out_dim=num_tasks, loss_metric=loss_metric,
-        task_type=task_type, train_dataset=train_dataset, dataset_degree=deg, use_cuda=argsdict['gpus'] == 1)
+        task_type=task_type)
 
     print('Model summary: ')
     print(model)

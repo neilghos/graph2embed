@@ -5,12 +5,10 @@ This repo copy is validated as a trimmed, experiment-focused subset of the upstr
 
 ## Scope Preserved From Upstream
 
-- The active GNN backbones are still the upstream set:
+- The active GNN backbones are the retained upstream subset:
   - `GCN`
-  - `GAT`
   - `GATv2`
   - `GIN`
-  - `PNA`
 - The standard baseline readouts still behave as upstream for the retained subset:
   - `sum`
   - `mean`

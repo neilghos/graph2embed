@@ -8,9 +8,7 @@ import torch_geometric
 from collections import defaultdict
 from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix, matthews_corrcoef
 from torch.nn import Linear, BatchNorm1d, ReLU, Dropout
-from torch_geometric.nn import GCNConv, GATConv, GATv2Conv, GINConv, PNAConv, global_add_pool, global_mean_pool, global_max_pool
-from torch_geometric.utils import degree
-from tqdm.auto import tqdm
+from torch_geometric.nn import GCNConv, GATv2Conv, GINConv, global_add_pool, global_mean_pool, global_max_pool
 
 
 def get_regression_metrics(y_true, y_pred):
@@ -38,19 +36,6 @@ def get_classification_metrics(y_true, y_pred, digits=6):
 
     return confusion_matrix(y_true, y_pred), roc_auc, classification_report(y_true, y_pred, digits=digits), matthews_corrcoef(y_true, y_pred)
 
-
-def get_degrees(train_dataset_as_list, dataset_degree, use_cuda=True):
-    deg = torch.zeros(dataset_degree, dtype=torch.long, device=torch.device('cuda') if use_cuda else torch.device('cpu'))
-
-    print('Computing degrees for PNA...')
-    for data in tqdm(train_dataset_as_list):
-        d = degree(data.edge_index[1], num_nodes=data.num_nodes, dtype=torch.long)
-        bincount = torch.bincount(d, minlength=deg.numel())
-        deg += bincount.to(torch.device('cuda')) if use_cuda else bincount
-
-    return deg
-
-
 class GNN(pl.LightningModule):
     def __init__(self,
                  conv_type: str,
@@ -66,14 +51,8 @@ class GNN(pl.LightningModule):
                  num_layers: int,
                  gat_heads: int = None,
                  gat_dropouts: int = None,
-                 train_dataset: torch.utils.data.Dataset = None,
-                 dataset_degree: int = None,
-                 pna_num_towers: int = 5,
-                 pna_num_pre_layers: int = 1,
-                 pna_num_post_layers: int = 1,
                  walk_length: int = 5,
                  walks_per_node: int = 5,
-                 use_cuda: bool = False,
                  ):
         super(GNN, self).__init__()
 
@@ -90,16 +69,10 @@ class GNN(pl.LightningModule):
 
         self.gat_heads = gat_heads
         self.gat_dropouts = gat_dropouts
-        self.dataset_degree = dataset_degree
-        self.train_dataset = train_dataset
-        self.pna_num_towers = pna_num_towers
-        self.pna_num_pre_layers = pna_num_pre_layers
-        self.pna_num_post_layers = pna_num_post_layers
 
         self.walk_length = walk_length
         self.walks_per_node = walks_per_node
         self.num_layers = num_layers
-        self.use_cuda = use_cuda
 
         # Standard readouts preserve the node dimension; our walk reader is bidirectional.
         if self.readout == 'ours':
@@ -118,7 +91,7 @@ class GNN(pl.LightningModule):
         self.test_graphs_per_epoch = {}
 
         # Input assertions
-        assert self.conv_type in ['GCN', 'GAT', 'GATv2', 'GIN', 'PNA']
+        assert self.conv_type in ['GCN', 'GATv2', 'GIN']
         assert self.task_type in ['regression', 'binary_classification', 'multi_classification']
         assert self.readout in ['sum', 'mean', 'max', 'ours']
         assert self.loss_metric in ['MAE', 'MSE', 'BCEWithLogits', 'CrossEntropyLoss']
@@ -137,20 +110,6 @@ class GNN(pl.LightningModule):
                     convs.append((GCNConv(in_channels=self.gnn_intermediate_dim, out_channels=self.gnn_intermediate_dim, cached=False, normalize=True), 'x, edge_index -> x'))
                 else:
                     convs.append((GCNConv(in_channels=self.gnn_intermediate_dim, out_channels=self.gnn_output_node_dim, cached=False, normalize=True), 'x, edge_index -> x'))
-                convs.append(ReLU(inplace=True))
-
-        # GAT
-        if self.conv_type == 'GAT':
-            for i in range(self.num_layers):
-                if i == 0:
-                    convs.append((GATConv(in_channels=self.in_channels, out_channels=self.gnn_intermediate_dim, heads=self.gat_heads,
-                                            concat=True, dropout=self.gat_dropouts), 'x, edge_index -> x'))
-                elif i != self.num_layers - 1:
-                    convs.append((GATConv(in_channels=self.gnn_intermediate_dim * self.gat_heads, out_channels=self.gnn_intermediate_dim,
-                                            heads=self.gat_heads, concat=True, dropout=self.gat_dropouts), 'x, edge_index -> x'))
-                else:
-                    convs.append((GATConv(in_channels=self.gnn_intermediate_dim * self.gat_heads, out_channels=self.gnn_output_node_dim,
-                                            heads=self.gat_heads, concat=False, dropout=self.gat_dropouts), 'x, edge_index -> x'))
                 convs.append(ReLU(inplace=True))
 
         # GATv2
@@ -197,26 +156,6 @@ class GNN(pl.LightningModule):
                             ReLU()
                             )
                         ), 'x, edge_index -> x'))
-                convs.append(ReLU(inplace=True))
-
-        # PNA
-        if self.conv_type == 'PNA':
-            aggregators = ['mean', 'min', 'max', 'std']
-            scalers = ['identity', 'amplification', 'attenuation']
-            deg = get_degrees(self.train_dataset, self.dataset_degree, use_cuda=self.use_cuda)
-
-            pna_common_args = dict(aggregators=aggregators, scalers=scalers, deg=deg,
-                                   towers=self.pna_num_towers,
-                                   pre_layers=self.pna_num_pre_layers, post_layers=self.pna_num_post_layers,
-                                   divide_input=False)
-
-            for i in range(self.num_layers):
-                if i == 0:
-                    convs.append((PNAConv(in_channels=self.in_channels, out_channels=self.gnn_intermediate_dim, **pna_common_args), 'x, edge_index -> x'))
-                elif i != self.num_layers - 1:
-                    convs.append((PNAConv(in_channels=self.gnn_intermediate_dim, out_channels=self.gnn_intermediate_dim, **pna_common_args), 'x, edge_index -> x'))
-                else:
-                    convs.append((PNAConv(in_channels=self.gnn_intermediate_dim, out_channels=self.gnn_output_node_dim, **pna_common_args), 'x, edge_index -> x'))
                 convs.append(ReLU(inplace=True))
 
         self.convs = torch_geometric.nn.Sequential('x, edge_index', convs)
@@ -432,9 +371,6 @@ class GNN(pl.LightningModule):
 
         parser.add_argument('--gat_heads', type=int)
         parser.add_argument('--gat_dropouts', type=float)
-        parser.add_argument('--pna_num_towers', type=int)
-        parser.add_argument('--pna_num_pre_layers', type=int)
-        parser.add_argument('--pna_num_post_layers', type=int)
         parser.add_argument('--walk_length', type=int, default=5)
         parser.add_argument('--walks_per_node', type=int, default=5)
 
