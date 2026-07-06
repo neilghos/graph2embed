@@ -4,7 +4,7 @@ import argparse
 import random
 import numpy as np
 from dataset import get_dataset
-from model import LSTMReaderGraphEmbedding
+from lstmreader import LSTMReaderGraphEmbedding
 
 import os
 

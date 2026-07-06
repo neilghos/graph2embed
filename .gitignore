@@ -9,4 +9,12 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-*./pth
+*.pth
+*.json
+*.csv
+
+/src/Supplementary materials
+/src/QM9_permutations
+/src/download_dir
+/src/code/pubchem_datasets
+/src/runs
